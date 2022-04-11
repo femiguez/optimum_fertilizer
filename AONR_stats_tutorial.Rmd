@@ -1,0 +1,205 @@
+---
+title: 'Estimating AONR and EONR with R: A tutorial and case study'
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+\newcommand{\kgha}{$\mathrm{kg \; ha^{-1}}$}
+
+# Preliminaries
+
+First we need to load a few packages
+
+```{r preliminaries}
+library(ggplot2)
+library(nlraa)
+library(car)
+library(mgcv)
+library(magrittr)
+## Load function to compute the EONR
+source("eonr.R")
+```
+
+# Introduction
+
+This tutorial and case study are intended to illustrate the process of estimating AONR and EONR with a real dataset. The data here were obtained from Table 1 from a publication by Francis et al. (2021). When estimating the EONR it is important that the units for fertilizer and yield match. For that reason, we use $kg \; ha^{-1}$ for yield and for the fertilizer.
+
+```{r read-data}
+red <- read.csv("red_clover.csv")
+## Create column with yield in kg/ha
+red$Yield_kgha <- red$Yield * 1e3
+## Visualize the data
+ggplot(data = red, aes(x = Nrate, y = Yield_kgha)) + 
+  geom_point() +
+  ylab("Yield (kg/ha)") + 
+  xlab("N rate (kg/ha)") + 
+  theme_bw()
+```
+
+# Simple Analysis
+
+The first approach will be to fit the linear-plateau and quadratic-plateau (with 3 parameters) models and assess the impact of the uncertainty in the model choice. In terms for model fit, both models have identical AIC values and number of parameters. The R-squared is not computed or included here but it would be identical.
+
+```{r first-fit}
+fm.QP <- nls(Yield_kgha ~ SSquadp3xs(Nrate, a, b, xs), data = red)
+fm.LP <- nls(Yield_kgha ~ SSlinp(Nrate, a, b, xs), data = red)
+
+(ictab <- IC_tab(fm.QP, fm.LP)) ## Identical fit
+
+ndat <- data.frame(Nrate = seq(min(red$Nrate), max(red$Nrate), length.out = 50))
+prds.QP <- predict_nls(fm.QP, newdata = ndat, interval = "conf")
+ndatA.QP <- cbind(ndat, prds.QP)
+
+prds.LP <- predict_nls(fm.LP, newdata = ndat, interval = "conf")
+ndatA.LP <- cbind(ndat, prds.LP)
+
+ggplot() + 
+  geom_point(data = red, aes(x = Nrate, y = Yield_kgha)) + 
+  geom_line(data = ndatA.QP, aes(Nrate, Estimate, color = "QP")) + 
+  geom_line(data = ndatA.LP, aes(Nrate, Estimate, color = "LP")) + 
+  ylab("Yield (kg/ha)") + 
+  xlab("N rate (kg/ha)") + 
+  guides(color = guide_legend(title = "Model")) + 
+  theme_bw()
+```
+
+## Computing AONR and EONR
+
+Given that both models have identical fit, AIC and R-squares it is reasonable to instead apply model averaging to resolve this conflict. The AONR estimate for each model is simply the break-point, which is a parameter from the model. For LP it is `r round(coef(fm.LP)[3])` and for QP it is `r round(coef(fm.QP)[3])` \kgha. In order to compute the confidence intervals we could use the profile method or bootstrap. We choose the bootstrap method as it will be more generally applicable to other model fits later. It is important to note that in the code below the AIC-derived weights are used to compute the **AONR.avg**. The object **ictab** in this case has a column calles **weights** that when matrix-multiplied by the AONR for QP and LP, provides the average AONR. 
+
+```{r aonr-eonr, cache = TRUE}
+## Extract AONR for both models
+AONR.LP <- round(coef(fm.LP)[3])
+AONR.QP <- round(coef(fm.QP)[3])
+### Confidence intervals for AONR estimates ###
+fm.QP.bt <- boot_nls(fm.QP, R = 5e3, cores = 4)
+fm.LP.bt <- boot_nls(fm.LP, R = 5e3, cores = 4)
+
+AONR.QP.ci <- confint(fm.QP.bt)
+AONR.LP.ci <- confint(fm.LP.bt)
+
+## Model averaging
+prds.avg <- predict_nls(fm.LP, fm.QP, newdata = ndat, interval = "conf")
+ndatA.avg <- cbind(ndat, prds.avg)
+
+AONR.avg <- round(ictab$weight %*% c(coef(fm.QP)[3], coef(fm.LP)[3]))
+
+prds.avg <- predict_nls(fm.LP, fm.QP, newdata = ndat, interval = "conf")
+ndatA.avg <- cbind(ndat, prds.avg)
+
+AONR.avg.ci <- confint(c(fm.QP.bt, fm.LP.bt)) 
+
+ggplot() + 
+  geom_point(data = red, aes(x = Nrate, y = Yield_kgha)) + 
+  geom_line(data = ndatA.QP, aes(Nrate, Estimate, color = "QP")) + 
+  geom_line(data = ndatA.LP, aes(Nrate, Estimate, color = "LP")) +
+  geom_line(data = ndatA.avg, aes(Nrate, Estimate, color = "avg")) + 
+  geom_point(aes(x = coef(fm.LP)[3], y = 5000, color = "LP"), size = 2) + 
+  geom_errorbarh(aes(xmin = AONR.LP.ci[3,1], xmax = AONR.LP.ci[3,2], y = 5000, 
+                     color = "LP")) + 
+  geom_point(aes(x = coef(fm.QP)[3], y = 4800, color = "QP"), size = 2) + 
+  geom_errorbarh(aes(xmin = AONR.QP.ci[3,1], xmax = AONR.QP.ci[3,2], y = 4800, 
+                     color = "QP")) +
+  geom_point(aes(x = AONR.avg, y = 4600, color = "avg"), size = 2) + 
+  geom_errorbarh(aes(xmin = AONR.avg.ci[3,1], xmax = AONR.avg.ci[3,2], y = 4600, 
+                     color = "avg")) + 
+  guides(color = guide_legend(title = element_blank())) + 
+  theme_bw() + xlab("N (kg/ha)") + ylab("Yield (kg/ha)") + 
+  ggtitle("Model averaging method")
+
+```
+
+Even though the differences are small, using model averaging better accounts for the uncertainty in the choice between the LP and QP models. Similarly, by using bootstrap we can combine the uncertainty in the bootstrap samples from the two models and compute the 95% confidence interval for the AONR for the average model.
+
+```{r ANOR-table}
+aonrs <- data.frame(model = c("LP", "QP", "avg"),
+                  AONR = c(AONR.LP, AONR.QP, AONR.avg),
+                  lower = round(c(AONR.LP.ci[3, 1], AONR.QP.ci[3, 1], AONR.avg.ci[3, 1])),
+                  upper = round(c(AONR.LP.ci[3, 2], AONR.QP.ci[3, 2], AONR.avg.ci[3, 2])))
+knitr::kable(aonrs, 
+             caption = "AONR and confidece intervals for LP, QP and average method") %>%
+  kableExtra::kable_styling(full_width = FALSE)
+```
+
+We need to be careful when computing the EONR. First, we need a fertilizer to grain price ratio and we use a value of 5.6 in this case. For the LP model, the EONR is determined by the slope and when this slope is greater than the fertilizer to grain price ratio, then the EONR is equivalent to the AONR. For the QP model, the EONR will be somewhat lower than the AONR. For this we can use the **eonr** function which we sourced at the beginning of this tutorial (this function is available in github: https://github.com/femiguez/optimum_fertilizer).
+
+```{r QP-EONR}
+EONR.LP <- coef(fm.LP)[3] ## LP EONR
+EONR.QP <- eonr(fm.QP, max.rate = coef(fm.QP)[3]) ## QP EONR
+## Taking the mean in this case is sensible because the AIC weights
+## for both models were identical. Otherwise, consider using AIC weights
+## as in the example above
+EONR.avg <- mean(c(EONR.LP, EONR.QP))
+eonrs <- data.frame(model = c("LP", "QP", "avg"),
+                  EONR = round(c(EONR.LP, EONR.QP, EONR.avg)))
+knitr::kable(eonrs, caption = "EONR for LP, QP and average method") %>%
+  kableExtra::kable_styling(full_width = FALSE)
+```
+
+\newpage 
+
+## What about GAMS?
+
+Generalized Additive Models are gaining traction in the analysis of agronomic data. They are one of the best options for certain types of data. However, when used for estimating the AONR (or EONR) they can be fairly unstable as the typical sample size is not sufficiently large. Having less than 15-20 N rates means that the fit will vary substantially depending on the dimension of the basis used. This is illustrated below. Different values of $k$ result in fairly different fits and therefore in different estimates for the EONR. We do not estimate the AONR as it is not defined for GAM models given that the function does not necessarily reach a plateau.
+
+```{r gams}
+fm.G3.kgha <- gam(Yield_kgha ~ s(Nrate, k = 3), data = red)
+fm.G4.kgha <- gam(Yield_kgha ~ s(Nrate, k = 4), data = red)
+fm.G5.kgha <- gam(Yield_kgha ~ s(Nrate, k = 5), data = red)
+fm.G6.kgha <- gam(Yield_kgha ~ s(Nrate, k = 6), data = red)
+
+eonr.G3 <- eonr(fm.G3.kgha)
+eonr.G4 <- eonr(fm.G4.kgha)
+eonr.G5 <- eonr(fm.G5.kgha)
+eonr.G6 <- eonr(fm.G6.kgha)
+
+prds.G3 <- predict_gam(fm.G3.kgha, newdata = ndat, interval = "conf")
+ndatA.G3 <- cbind(ndat, prds.G3)
+
+prds.G4 <- predict_gam(fm.G4.kgha, newdata = ndat, interval = "conf")
+ndatA.G4 <- cbind(ndat, prds.G4)
+
+prds.G5 <- predict_gam(fm.G5.kgha, newdata = ndat, interval = "conf")
+ndatA.G5 <- cbind(ndat, prds.G5)
+
+prds.G6 <- predict_gam(fm.G6.kgha, newdata = ndat, interval = "conf")
+ndatA.G6 <- cbind(ndat, prds.G6)
+
+ggplot() + 
+  geom_point(data = red, aes(x = Nrate, y = Yield_kgha)) + 
+  geom_line(data = ndatA.G3, aes(Nrate, Estimate, color = "GAM k = 3")) + 
+  geom_line(data = ndatA.G4, aes(Nrate, Estimate, color = "GAM k = 4")) + 
+  geom_line(data = ndatA.G5, aes(Nrate, Estimate, color = "GAM k = 5")) + 
+  geom_line(data = ndatA.G6, aes(Nrate, Estimate, color = "GAM k = 6")) + 
+  geom_point(aes(x = eonr.G3, y = 4000, color = "GAM k = 3"), size = 2.5) + 
+  geom_point(aes(x = eonr.G4, y = 4000, color = "GAM k = 4"), size = 2.5) + 
+  geom_point(aes(x = eonr.G5, y = 4000, color = "GAM k = 5"), size = 2.5) + 
+  geom_point(aes(x = eonr.G6, y = 4000, color = "GAM k = 6"), size = 2.5) +
+  geom_text(aes(x = 200, y = 4600, label = "EONR estimates")) + 
+  guides(color = guide_legend(title = "Model")) + 
+  ggtitle("GAMs are unstable with small sample sizes") + 
+  theme_bw()
+```
+
+The estimates for the EONR for these different model choices are:
+
+```{r eonr-table}
+gam.eonrs <- data.frame(model = c("k = 3", "k = 4", "k = 5", "k = 6"),
+                  EONR = round(c(eonr.G3, eonr.G4, eonr.G5, eonr.G6)))
+knitr::kable(gam.eonrs, caption = "EONR for different GAMS") %>%
+  kableExtra::kable_styling(full_width = FALSE)
+```
+
+## Additional Details
+
+More details about this analysis can be found at: https://github.com/femiguez/optimum_fertilizer.
+
+# Reference
+
+Francis, HR, Ma, TF, Ruark, MD. Toward a standardized statistical methodology comparing optimum nitrogen rates among management practices: A bootstrapping approach. Agric Environ Lett 2021; 6:e20045. https://doi.org/10.1002/ael2.20045
